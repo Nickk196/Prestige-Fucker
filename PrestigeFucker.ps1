@@ -2,39 +2,60 @@
 .SYNOPSIS
     Scans javaw.exe process memory for known Prestige Client signatures.
 .DESCRIPTION
-    All memory enumeration and scanning is handled in C# via P/Invoke to
-    completely bypass PowerShell 5.1's [ref] struct marshalling bug.
+    Uses Windows API via P/Invoke to enumerate and read memory regions
+    of the javaw.exe process, then searches for a curated list of
+    signature strings indicative of Prestige Client injection.
 .NOTES
-    Requires elevated (Administrator) privileges.
+    Requires elevated (Administrator) privileges to open other processes.
+    Compatible with PowerShell 5.1+ and PowerShell 7+.
 #>
 
- $CSharpCode = @'
+ $code = @'
 using System;
 using System.Collections.Generic;
 using System.Runtime.InteropServices;
 
-public static class PrestigeScanner
+public static class MemScan
 {
     [Flags]
     public enum ProcessAccessFlags : uint
     {
+        All = 0x001F0FFF,
+        Terminate = 0x00000001,
+        CreateThread = 0x00000002,
+        VMOperation = 0x00000008,
         VMRead = 0x00000010,
+        VMWrite = 0x00000020,
+        DupHandle = 0x00000040,
+        SetInformation = 0x00000200,
         QueryInformation = 0x00000400,
-        QueryLimitedInformation = 0x00001000
-    }
-
-    [Flags]
-    public enum MemoryProtection : uint
-    {
-        NoAccess = 0x01, ReadOnly = 0x02, ReadWrite = 0x04, WriteCopy = 0x08,
-        Execute = 0x10, ExecuteRead = 0x20, ExecuteReadWrite = 0x40,
-        ExecuteWriteCopy = 0x80, Guard = 0x100, NoChange = 0x400
+        QueryLimitedInformation = 0x00001000,
+        Synchronize = 0x00100000
     }
 
     [Flags]
     public enum AllocationProtect : uint
     {
-        Commit = 0x1000, Reserve = 0x2000, Decommit = 0x4000, Release = 0x8000
+        Commit = 0x1000,
+        Reserve = 0x2000,
+        Decommit = 0x4000,
+        Release = 0x8000
+    }
+
+    [Flags]
+    public enum MemoryProtection : uint
+    {
+        NoAccess = 0x01,
+        ReadOnly = 0x02,
+        ReadWrite = 0x04,
+        WriteCopy = 0x08,
+        Execute = 0x10,
+        ExecuteRead = 0x20,
+        ExecuteReadWrite = 0x40,
+        ExecuteWriteCopy = 0x80,
+        Guard = 0x100,
+        NoChange = 0x400,
+        Image = 0x1000000
     }
 
     [StructLayout(LayoutKind.Sequential)]
@@ -50,18 +71,31 @@ public static class PrestigeScanner
     }
 
     [DllImport("kernel32.dll", SetLastError = true)]
-    private static extern IntPtr OpenProcess(ProcessAccessFlags dwDesiredAccess, bool bInheritHandle, int dwProcessId);
+    public static extern IntPtr OpenProcess(
+        ProcessAccessFlags processAccess,
+        bool bInheritHandle,
+        int processId);
 
     [DllImport("kernel32.dll", SetLastError = true)]
-    private static extern bool ReadProcessMemory(IntPtr hProcess, IntPtr lpBaseAddress, [Out] byte[] lpBuffer, int dwSize, out IntPtr lpNumberOfBytesRead);
+    public static extern bool ReadProcessMemory(
+        IntPtr hProcess,
+        IntPtr lpBaseAddress,
+        [Out] byte[] lpBuffer,
+        int dwSize,
+        out IntPtr lpNumberOfBytesRead);
 
     [DllImport("kernel32.dll", SetLastError = true)]
-    private static extern int VirtualQueryEx(IntPtr hProcess, IntPtr lpAddress, IntPtr lpBuffer, uint dwSize);
+    private static extern int VirtualQueryEx(
+        IntPtr hProcess,
+        IntPtr lpAddress,
+        IntPtr lpBuffer,
+        uint dwSize);
 
     [DllImport("kernel32.dll", SetLastError = true)]
-    private static extern bool CloseHandle(IntPtr hObject);
+    public static extern bool CloseHandle(IntPtr hObject);
 
-    private static List<MEMORY_BASIC_INFORMATION> EnumerateRegions(IntPtr hProcess)
+    // Enumerate all memory regions in C# to avoid PowerShell [ref] struct bugs
+    public static List<MEMORY_BASIC_INFORMATION> EnumerateRegions(IntPtr hProcess)
     {
         var regions = new List<MEMORY_BASIC_INFORMATION>();
         IntPtr address = IntPtr.Zero;
@@ -75,7 +109,8 @@ public static class PrestigeScanner
                 int ret = VirtualQueryEx(hProcess, address, pMbi, (uint)mbiSize);
                 if (ret == 0) break;
 
-                MEMORY_BASIC_INFORMATION mbi = (MEMORY_BASIC_INFORMATION)Marshal.PtrToStructure(pMbi, typeof(MEMORY_BASIC_INFORMATION));
+                MEMORY_BASIC_INFORMATION mbi =
+                    (MEMORY_BASIC_INFORMATION)Marshal.PtrToStructure(pMbi, typeof(MEMORY_BASIC_INFORMATION));
                 regions.Add(mbi);
 
                 long next = mbi.BaseAddress.ToInt64() + mbi.RegionSize.ToInt64();
@@ -83,114 +118,27 @@ public static class PrestigeScanner
                 address = new IntPtr(next);
             }
         }
-        finally { Marshal.FreeHGlobal(pMbi); }
+        finally
+        {
+            Marshal.FreeHGlobal(pMbi);
+        }
 
         return regions;
-    }
-
-    public static string ScanProcess(int targetPid, byte[][] signatures, string[] sigNames, string[] blacklist, out int regionCount, out long bytesScanned)
-    {
-        regionCount = 0;
-        bytesScanned = 0;
-        var hits = new Dictionary<string, List<long>>();
-        var blackSet = new HashSet<string>(blacklist);
-
-        IntPtr hProc = OpenProcess(ProcessAccessFlags.VMRead | ProcessAccessFlags.QueryInformation | ProcessAccessFlags.QueryLimitedInformation, false, targetPid);
-        if (hProc == IntPtr.Zero) return "ACCESS_DENIED";
-
-        try
-        {
-            var regions = EnumerateRegions(hProc);
-            byte[] buffer = new byte[4 * 1024 * 1024];
-
-            foreach (var mbi in regions)
-            {
-                uint protect = (uint)mbi.Protect;
-                bool readable = (protect & 0x02) != 0 || (protect & 0x04) != 0 || 
-                                (protect & 0x20) != 0 || (protect & 0x40) != 0 ||
-                                (protect & 0x08) != 0 || (protect & 0x80) != 0;
-
-                if (!readable) continue;
-
-                long regionSize = mbi.RegionSize.ToInt64();
-                long baseAddr = mbi.BaseAddress.ToInt64();
-                long offset = 0;
-                regionCount++;
-                bytesScanned += regionSize;
-
-                while (offset < regionSize)
-                {
-                    int toRead = (int)Math.Min(buffer.Length, regionSize - offset);
-                    IntPtr bytesRead;
-
-                    if (ReadProcessMemory(hProc, new IntPtr(baseAddr + offset), buffer, toRead, out bytesRead) && bytesRead.ToInt64() > 0)
-                    {
-                        int readLen = bytesRead.ToInt32();
-
-                        for (int s = 0; s < signatures.Length; s++)
-                        {
-                            if (blackSet.Contains(sigNames[s])) continue;
-
-                            byte[] sig = signatures[s];
-                            int sigLen = sig.Length;
-                            if (sigLen > readLen) continue;
-
-                            int maxIdx = readLen - sigLen;
-                            for (int i = 0; i <= maxIdx; i++)
-                            {
-                                bool match = true;
-                                for (int j = 0; j < sigLen; j++)
-                                {
-                                    if (buffer[i + j] != sig[j]) { match = false; break; }
-                                }
-
-                                if (match)
-                                {
-                                    long hitAddr = baseAddr + offset + i;
-                                    if (!hits.ContainsKey(sigNames[s]))
-                                        hits[sigNames[s]] = new List<long>();
-
-                                    if (!hits[sigNames[s]].Contains(hitAddr))
-                                        hits[sigNames[s]].Add(hitAddr);
-
-                                    i += sigLen - 1;
-                                }
-                            }
-                        }
-                    }
-                    offset += toRead;
-                }
-            }
-        }
-        finally { CloseHandle(hProc); }
-
-        if (hits.Count == 0) return "CLEAN";
-        
-        var sb = new System.Text.StringBuilder();
-        foreach (var kvp in hits)
-        {
-            sb.Append("HIT|" + kvp.Key + "|");
-            for (int i = 0; i < kvp.Value.Count; i++)
-            {
-                if (i > 0) sb.Append(",");
-                sb.Append("0x" + kvp.Value[i].ToString("x"));
-            }
-            sb.Append("\n");
-        }
-        return sb.ToString();
     }
 }
 '@
 
-Add-Type -TypeDefinition $CSharpCode -Language CSharp
+Add-Type -TypeDefinition $code -Language CSharp
 
-# ── Exclusion list ────────────────────────────────────────────────────────
+# ── Exclusion list (addresses or strings to skip) ─────────────────────────
  $blacklist = @(
     '()Ldev/zprestige/prestige/a7;'
 )
 
 # ── Signature Database ────────────────────────────────────────────────────
+
  $signatures = @(
+    # Core API / Management layer
     'dev/zprestige/prestige/api/module/Module'
     'dev/zprestige/prestige/client/management/ModuleManager'
     'dev/zprestige/prestige/client/Prestige'
@@ -207,6 +155,8 @@ Add-Type -TypeDefinition $CSharpCode -Language CSharp
     'dev/zprestige/prestige/api/setting/StringSetting'
     'dev/zprestige/prestige/api/setting/MultiModeSetting'
     'dev/zprestige/prestige/api/setting/Setting'
+
+    # Reflective method descriptors
     'dev/zprestige/prestige/client/management/ModuleManager.setMainColor'
     'dev/zprestige/prestige/client/management/ModuleManager.setMenuBind'
     'dev/zprestige/prestige/client/management/ModuleManager.getModuleList'
@@ -223,6 +173,8 @@ Add-Type -TypeDefinition $CSharpCode -Language CSharp
     'dev/zprestige/prestige/api/setting/Setting.isVisible'
     'dev/zprestige/prestige/api/setting/Setting.getValue'
     'dev/zprestige/prestige/api/setting/Setting.setValue'
+
+    # Setting sub-class descriptors
     'dev/zprestige/prestige/api/setting/IntSetting.getMin'
     'dev/zprestige/prestige/api/setting/IntSetting.getMax'
     'dev/zprestige/prestige/api/setting/FloatSetting.getMin'
@@ -239,16 +191,22 @@ Add-Type -TypeDefinition $CSharpCode -Language CSharp
     'dev/zprestige/prestige/api/setting/MinMaxSetting.getMin'
     'dev/zprestige/prestige/api/setting/MinMaxSetting.setMaxValue'
     'dev/zprestige/prestige/api/setting/MinMaxSetting.getMax'
+
+    # Socials / Config management
     'dev/zprestige/prestige/client/management/SocialsManager.addFriend'
     'dev/zprestige/prestige/client/management/SocialsManager.removeFriend'
     'dev/zprestige/prestige/client/management/SocialsManager.getPlayerList'
     'dev/zprestige/prestige/client/management/SocialsManager.getFriends'
     'dev/zprestige/prestige/client/management/ConfigManager.load'
     'dev/zprestige/prestige/client/management/ConfigManager.save'
+
+    # Constants, loader, and native bridge
     'dev/zprestige/prestige/Constants'
     'dev/zprestige/prestige/loader/PrestigeClient'
     'dev.zprestige.prestige.Native'
     'dev.zprestige.prestige.client.Prestige'
+
+    # Branding / UI strings
     '@Prestige'
     'Prestige Client'
     'Initializing Prestige'
@@ -264,9 +222,13 @@ Add-Type -TypeDefinition $CSharpCode -Language CSharp
     'Failed to load Prestige main class'
     'Failed to create Prestige main instance'
     '_Prestige_Status_'
+
+    # C2 / API endpoints
     'https://api.prestigeclient.vip'
     'https://prestigeclient.vip/'
     'api.prestigeclient.vip'
+
+    # Embedded resource paths
     'assets/prestige/icons/categories/'
     'assets/prestige/sounds/hover.wav'
     'assets/prestige/sounds/pop.wav'
@@ -279,22 +241,36 @@ Add-Type -TypeDefinition $CSharpCode -Language CSharp
     'assets/prestige/sounds/woosh.wav'
     'assets/prestige/icons/other/'
     'assets/prestige/icons/logo.png'
+
+    # Build-path artefacts left in the binary
     'Prestige-Injection'
     'Prestige-Classloader-Injector'
     'Prestige Software Development'
     'JNI_Auth'
+
+    # DES encryption marker
     'DES&dev/zprestige/prestige/client/Prestige'
 )
 
-# ── Prepare arrays for C# ─────────────────────────────────────────────────
- $sigNameArray = [string[]]$signatures
- $sigByteArray = New-Object byte[][] ($signatures.Count)
-for ($i = 0; $i -lt $signatures.Count; $i++) {
-    $sigByteArray[$i] = [System.Text.Encoding]::UTF8.GetBytes($signatures[$i])
+# Pre-convert signatures to byte arrays for fast comparison
+ $sigBytes = foreach ($s in $signatures) {
+    @{ String = $s; Bytes = [System.Text.Encoding]::UTF8.GetBytes($s) }
 }
- $blacklistArray = [string[]]$blacklist
 
-# ── Main Logic ────────────────────────────────────────────────────────────
+# ── Helper: Readable memory protection filter ─────────────────────────────
+function Test-ReadableProtect([uint32]$protect) {
+    $readable = [uint32](
+        [MemScan+MemoryProtection]::ReadOnly -bor
+        [MemScan+MemoryProtection]::ReadWrite -bor
+        [MemScan+MemoryProtection]::ExecuteRead -bor
+        [MemScan+MemoryProtection]::ExecuteReadWrite -bor
+        [MemScan+MemoryProtection]::WriteCopy -bor
+        [MemScan+MemoryProtection]::ExecuteWriteCopy
+    )
+    return ($protect -band $readable) -ne 0
+}
+
+# ── Main Scan Logic ───────────────────────────────────────────────────────
 
 Write-Host ''
 Write-Host '  ╔══════════════════════════════════════════════════════════╗' -ForegroundColor Cyan
@@ -302,6 +278,7 @@ Write-Host '  ║       Prestige Client Memory Scanner for javaw.exe     ║' -F
 Write-Host '  ╚══════════════════════════════════════════════════════════╝' -ForegroundColor Cyan
 Write-Host ''
 
+# Check admin
  $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 if (-not $isAdmin) {
     Write-Host '[!] WARNING: Not running as Administrator.' -ForegroundColor Yellow
@@ -309,6 +286,7 @@ if (-not $isAdmin) {
     Write-Host ''
 }
 
+# Locate javaw processes
  $procs = Get-Process -Name 'javaw' -ErrorAction SilentlyContinue
 if (-not $procs -or $procs.Count -eq 0) {
     Write-Host '[x] No javaw.exe process found. Is Minecraft running?' -ForegroundColor Red
@@ -321,39 +299,122 @@ foreach ($p in $procs) {
 }
 Write-Host ''
 
+# ── MEM_COMMIT constant (0x1000) — what VirtualQueryEx actually returns for State
+$MEM_COMMIT = [uint32]0x1000
+
+# Scan each process
  $totalHits = 0
 
 foreach ($proc in $procs) {
+    # FIX 1: renamed from $pid (reserved PS variable) to $procId
     $procId = $proc.Id
     Write-Host ("── Scanning PID {0} ──" -f $procId) -ForegroundColor White
 
+    $access = [MemScan+ProcessAccessFlags]::VMRead -bor `
+              [MemScan+ProcessAccessFlags]::QueryInformation -bor `
+              [MemScan+ProcessAccessFlags]::QueryLimitedInformation
+    $hProc = [MemScan]::OpenProcess($access, $false, $procId)
+
+    if ($hProc -eq [IntPtr]::Zero) {
+        $err = [System.Runtime.InteropServices.Marshal]::GetLastWin32Error()
+        Write-Host ("    [x] OpenProcess failed (Win32 error $err — " +
+                     'access denied or process protected)') -ForegroundColor Red
+        Write-Host ''
+        continue
+    }
+
+    # Enumerate all memory regions via C# (avoids PS [ref] struct bug)
+    $regions = [MemScan]::EnumerateRegions($hProc)
+
+    $processHits = @{}
     $regionCount = 0
     $bytesScanned = [long]0
-    
-    $result = [PrestigeScanner]::ScanProcess($procId, $sigByteArray, $sigNameArray, $blacklistArray, [ref] $regionCount, [ref] $bytesScanned)
+    $bufferSize = 4 * 1024 * 1024  # 4 MB read chunks
+    $buffer = New-Object byte[] $bufferSize
+
+    foreach ($mbi in $regions) {
+        $regionSize = $mbi.RegionSize.ToInt64()
+        $stateVal   = [uint32]$mbi.State
+        $protect    = [uint32]$mbi.Protect
+        $baseAddress = $mbi.BaseAddress
+
+        # FIX 2: compare State against the real MEM_COMMIT value (0x1000),
+        # not against MemoryProtection enum entries (which are protection flags,
+        # not state flags — this was why Prestige was never detected).
+        $committed = ($stateVal -eq $MEM_COMMIT)
+
+        if ($committed -and (Test-ReadableProtect $protect)) {
+            $regionCount++
+            $bytesScanned += $regionSize
+
+            # Read the region in chunks
+            $offset = 0
+            while ($offset -lt $regionSize) {
+                $toRead = [Math]::Min($bufferSize, $regionSize - $offset)
+                $bytesRead = [IntPtr]::Zero
+                $readAddr = [IntPtr]::new($baseAddress.ToInt64() + $offset)
+
+                $ok = [MemScan]::ReadProcessMemory(
+                    $hProc, $readAddr, $buffer, $toRead, [ref] $bytesRead)
+
+                if ($ok -and $bytesRead.ToInt64() -gt 0) {
+                    $readLen = $bytesRead.ToInt64()
+
+                    # Search for each signature in this chunk
+                    foreach ($sig in $sigBytes) {
+                        # Skip blacklisted strings
+                        $skip = $false
+                        foreach ($bl in $blacklist) {
+                            if ($sig.String -eq $bl) { $skip = $true; break }
+                        }
+                        if ($skip) { continue }
+
+                        $sigLen = $sig.Bytes.Length
+                        if ($sigLen -gt $readLen) { continue }
+
+                        $maxIdx = $readLen - $sigLen
+                        for ($i = 0; $i -le $maxIdx; $i++) {
+                            $match = $true
+                            for ($j = 0; $j -lt $sigLen; $j++) {
+                                if ($buffer[$i + $j] -ne $sig.Bytes[$j]) {
+                                    $match = $false
+                                    break
+                                }
+                            }
+                            if ($match) {
+                                $hitAddr = '0x{0:x}' -f ($readAddr.ToInt64() + $i)
+                                if (-not $processHits.ContainsKey($sig.String)) {
+                                    $processHits[$sig.String] = [System.Collections.Generic.List[string]]::new()
+                                }
+                                if ($hitAddr -notin $processHits[$sig.String]) {
+                                    $processHits[$sig.String].Add($hitAddr)
+                                }
+                                $i += $sigLen - 1
+                            }
+                        }
+                    }
+                }
+                $offset += $toRead
+            }
+        }
+    }
+
+    [MemScan]::CloseHandle($hProc)
+
+    # ── Report Results ────────────────────────────────────────────────
+    $hitCount = 0
+    foreach ($key in $processHits.Keys) {
+        $hitCount += $processHits[$key].Count
+    }
+    $totalHits += $hitCount
 
     Write-Host ("    Regions scanned : {0:N0}" -f $regionCount) -ForegroundColor DarkGray
     Write-Host ("    Data scanned    : {0:N2} MB" -f ($bytesScanned / 1MB)) -ForegroundColor DarkGray
     Write-Host ''
 
-    if ($result -eq "ACCESS_DENIED") {
-        Write-Host '    [x] Access denied. Run as Administrator.' -ForegroundColor Red
-    } elseif ($result -eq "CLEAN") {
+    if ($hitCount -eq 0) {
         Write-Host '    [OK] No Prestige Client signatures detected.' -ForegroundColor Green
     } else {
-        $processHits = @{}
-        $hitCount = 0
-        
-        foreach ($line in $result -split "`n") {
-            if ($line -match '^HIT\|(.+?)\|(.+)$') {
-                $sig = $matches[1]
-                $addrs = $matches[2] -split ','
-                $processHits[$sig] = $addrs
-                $hitCount += $addrs.Count
-            }
-        }
-        $totalHits += $hitCount
-
         Write-Host ("    [!!] {0} signature hit(s) found:" -f $hitCount) -ForegroundColor Red
         Write-Host ''
 
@@ -375,6 +436,7 @@ foreach ($proc in $procs) {
             foreach ($sig in $processHits.Keys) {
                 foreach ($pattern in $categories[$cat]) {
                     if ($sig -like "*$pattern*") {
+                        # For obfuscated classes, exclude already-categorized ones
                         if ($cat -eq 'Obfuscated Classes') {
                             $isOther = $false
                             foreach ($otherCat in $categories.Keys) {
