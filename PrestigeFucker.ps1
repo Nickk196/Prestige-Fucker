@@ -10,12 +10,9 @@
     Compatible with PowerShell 5.1+ and PowerShell 7+.
 #>
 
-using namespace System.Runtime.InteropServices
-
-# ── P/Invoke Definitions ──────────────────────────────────────────────────
-
  $code = @'
 using System;
+using System.Collections.Generic;
 using System.Runtime.InteropServices;
 
 public static class MemScan
@@ -37,17 +34,12 @@ public static class MemScan
     }
 
     [Flags]
-    public enum AllocationType : uint
+    public enum AllocationProtect : uint
     {
         Commit = 0x1000,
         Reserve = 0x2000,
         Decommit = 0x4000,
-        Release = 0x8000,
-        Reset = 0x80000,
-        Physical = 0x400000,
-        TopDown = 0x100000,
-        WriteWatch = 0x200000,
-        LargePages = 0x20000000
+        Release = 0x8000
     }
 
     [Flags]
@@ -71,11 +63,11 @@ public static class MemScan
     {
         public IntPtr BaseAddress;
         public IntPtr AllocationBase;
-        public AllocationType AllocationProtect;
+        public AllocationProtect AllocationProtect;
         public IntPtr RegionSize;
         public MemoryProtection State;
         public MemoryProtection Protect;
-        public MemoryProtection Type;
+        public uint Type;
     }
 
     [DllImport("kernel32.dll", SetLastError = true)]
@@ -93,22 +85,57 @@ public static class MemScan
         out IntPtr lpNumberOfBytesRead);
 
     [DllImport("kernel32.dll", SetLastError = true)]
-    public static extern int VirtualQueryEx(
+    private static extern int VirtualQueryEx(
         IntPtr hProcess,
         IntPtr lpAddress,
-        out MEMORY_BASIC_INFORMATION lpBuffer,
+        IntPtr lpBuffer,
         uint dwSize);
 
     [DllImport("kernel32.dll", SetLastError = true)]
     public static extern bool CloseHandle(IntPtr hObject);
+
+    // Enumerate all memory regions in C# to avoid PowerShell [ref] struct bugs
+    public static List<MEMORY_BASIC_INFORMATION> EnumerateRegions(IntPtr hProcess)
+    {
+        var regions = new List<MEMORY_BASIC_INFORMATION>();
+        IntPtr address = IntPtr.Zero;
+        int mbiSize = Marshal.SizeOf(typeof(MEMORY_BASIC_INFORMATION));
+        IntPtr pMbi = Marshal.AllocHGlobal(mbiSize);
+
+        try
+        {
+            while (true)
+            {
+                int ret = VirtualQueryEx(hProcess, address, pMbi, (uint)mbiSize);
+                if (ret == 0) break;
+
+                MEMORY_BASIC_INFORMATION mbi =
+                    (MEMORY_BASIC_INFORMATION)Marshal.PtrToStructure(pMbi, typeof(MEMORY_BASIC_INFORMATION));
+                regions.Add(mbi);
+
+                long next = mbi.BaseAddress.ToInt64() + mbi.RegionSize.ToInt64();
+                if (next <= 0) break;
+                address = new IntPtr(next);
+            }
+        }
+        finally
+        {
+            Marshal.FreeHGlobal(pMbi);
+        }
+
+        return regions;
+    }
 }
 '@
 
 Add-Type -TypeDefinition $code -Language CSharp
 
+# ── Exclusion list (addresses or strings to skip) ─────────────────────────
+ $blacklist = @(
+    '()Ldev/zprestige/prestige/a7;'
+)
+
 # ── Signature Database ────────────────────────────────────────────────────
-# High-confidence signatures — API paths, loader classes, and branding
-# strings that uniquely identify Prestige Client in memory.
 
  $signatures = @(
     # Core API / Management layer
@@ -232,13 +259,15 @@ Add-Type -TypeDefinition $code -Language CSharp
 
 # ── Helper: Readable memory protection filter ─────────────────────────────
 function Test-ReadableProtect([uint32]$protect) {
-    $ro = [MemScan+MemoryProtection]::ReadOnly
-    $rw = [MemScan+MemoryProtection]::ReadWrite
-    $xc = [MemScan+MemoryProtection]::ExecuteRead
-    $xrw = [MemScan+MemoryProtection]::ExecuteReadWrite
-    $wc = [MemScan+MemoryProtection]::WriteCopy
-    $xwc = [MemScan+MemoryProtection]::ExecuteWriteCopy
-    return ($protect -band ($ro -bor $rw -bor $xc -bor $xrw -bor $wc -bor $xwc)) -ne 0
+    $readable = [uint32](
+        [MemScan+MemoryProtection]::ReadOnly -bor
+        [MemScan+MemoryProtection]::ReadWrite -bor
+        [MemScan+MemoryProtection]::ExecuteRead -bor
+        [MemScan+MemoryProtection]::ExecuteReadWrite -bor
+        [MemScan+MemoryProtection]::WriteCopy -bor
+        [MemScan+MemoryProtection]::ExecuteWriteCopy
+    )
+    return ($protect -band $readable) -ne 0
 }
 
 # ── Main Scan Logic ───────────────────────────────────────────────────────
@@ -277,7 +306,6 @@ foreach ($proc in $procs) {
     $pid = $proc.Id
     Write-Host ("── Scanning PID {0} ──" -f $pid) -ForegroundColor White
 
-    # Open process with VM_READ + QUERY_INFORMATION
     $access = [MemScan+ProcessAccessFlags]::VMRead -bor `
               [MemScan+ProcessAccessFlags]::QueryInformation -bor `
               [MemScan+ProcessAccessFlags]::QueryLimitedInformation
@@ -291,85 +319,81 @@ foreach ($proc in $procs) {
         continue
     }
 
-    # Enumerate all committed, readable memory regions
-    $address = [IntPtr]::Zero
-    $mbiSize = [System.Runtime.InteropServices.Marshal]::SizeOf([type][MemScan+MEMORY_BASIC_INFORMATION])
+    # Enumerate all memory regions via C# (avoids PS [ref] struct bug)
+    $regions = [MemScan]::EnumerateRegions($hProc)
+
     $processHits = @{}
     $regionCount = 0
     $bytesScanned = [long]0
     $bufferSize = 4 * 1024 * 1024  # 4 MB read chunks
     $buffer = New-Object byte[] $bufferSize
 
-    while ($true) {
-        $result = [MemScan]::VirtualQueryEx($hProc, $address, [ref]$mbi, $mbiSize)
-        if ($result -eq 0) { break }
-
+    foreach ($mbi in $regions) {
         $regionSize = $mbi.RegionSize.ToInt64()
         $state = $mbi.State
         $protect = $mbi.Protect
+        $baseAddress = $mbi.BaseAddress
 
         # Only scan committed, readable memory
-        if ($state -eq [MemScan+MemoryProtection]::ReadWrite -or
-            $state -eq [MemScan+MemoryProtection]::ReadOnly -or
-            $state -eq [MemScan+MemoryProtection]::ExecuteRead -or
-            $state -eq [MemScan+MemoryProtection]::ExecuteReadWrite) {
+        $committed = ($state -eq [MemScan+MemoryProtection]::ReadWrite) -or
+                     ($state -eq [MemScan+MemoryProtection]::ReadOnly) -or
+                     ($state -eq [MemScan+MemoryProtection]::ExecuteRead) -or
+                     ($state -eq [MemScan+MemoryProtection]::ExecuteReadWrite)
 
-            if (Test-ReadableProtect $protect) {
-                $regionCount++
-                $bytesScanned += $regionSize
+        if ($committed -and (Test-ReadableProtect $protect)) {
+            $regionCount++
+            $bytesScanned += $regionSize
 
-                # Read the region in chunks
-                $offset = 0
-                while ($offset -lt $regionSize) {
-                    $toRead = [Math]::Min($bufferSize, $regionSize - $offset)
-                    $bytesRead = [IntPtr]::Zero
-                    $baseAddr = [IntPtr]::new($address.ToInt64() + $offset)
+            # Read the region in chunks
+            $offset = 0
+            while ($offset -lt $regionSize) {
+                $toRead = [Math]::Min($bufferSize, $regionSize - $offset)
+                $bytesRead = [IntPtr]::Zero
+                $readAddr = [IntPtr]::new($baseAddress.ToInt64() + $offset)
 
-                    $ok = [MemScan]::ReadProcessMemory(
-                        $hProc, $baseAddr, $buffer, $toRead, [ref] $bytesRead)
+                $ok = [MemScan]::ReadProcessMemory(
+                    $hProc, $readAddr, $buffer, $toRead, [ref] $bytesRead)
 
-                    if ($ok -and $bytesRead.ToInt64() -gt 0) {
-                        $readLen = $bytesRead.ToInt64()
+                if ($ok -and $bytesRead.ToInt64() -gt 0) {
+                    $readLen = $bytesRead.ToInt64()
 
-                        # Search for each signature in this chunk
-                        foreach ($sig in $sigBytes) {
-                            $sigLen = $sig.Bytes.Length
-                            if ($sigLen -gt $readLen) { continue }
+                    # Search for each signature in this chunk
+                    foreach ($sig in $sigBytes) {
+                        # Skip blacklisted strings
+                        $skip = $false
+                        foreach ($bl in $blacklist) {
+                            if ($sig.String -eq $bl) { $skip = $true; break }
+                        }
+                        if ($skip) { continue }
 
-                            # Boyer-Moore-lite: scan byte-by-byte
-                            $maxIdx = $readLen - $sigLen
-                            for ($i = 0; $i -le $maxIdx; $i++) {
-                                $match = $true
-                                for ($j = 0; $j -lt $sigLen; $j++) {
-                                    if ($buffer[$i + $j] -ne $sig.Bytes[$j]) {
-                                        $match = $false
-                                        break
-                                    }
+                        $sigLen = $sig.Bytes.Length
+                        if ($sigLen -gt $readLen) { continue }
+
+                        $maxIdx = $readLen - $sigLen
+                        for ($i = 0; $i -le $maxIdx; $i++) {
+                            $match = $true
+                            for ($j = 0; $j -lt $sigLen; $j++) {
+                                if ($buffer[$i + $j] -ne $sig.Bytes[$j]) {
+                                    $match = $false
+                                    break
                                 }
-                                if ($match) {
-                                    $hitAddr = '0x{0:x}' -f ($baseAddr.ToInt64() + $i)
-                                    if (-not $processHits.ContainsKey($sig.String)) {
-                                        $processHits[$sig.String] = @()
-                                    }
-                                    # Avoid duplicate addresses for the same sig
-                                    if ($hitAddr -notin $processHits[$sig.String]) {
-                                        $processHits[$sig.String] += $hitAddr
-                                    }
-                                    # Skip past this match
-                                    $i += $sigLen - 1
+                            }
+                            if ($match) {
+                                $hitAddr = '0x{0:x}' -f ($readAddr.ToInt64() + $i)
+                                if (-not $processHits.ContainsKey($sig.String)) {
+                                    $processHits[$sig.String] = [System.Collections.Generic.List[string]]::new()
                                 }
+                                if ($hitAddr -notin $processHits[$sig.String]) {
+                                    $processHits[$sig.String].Add($hitAddr)
+                                }
+                                $i += $sigLen - 1
                             }
                         }
                     }
-                    $offset += $toRead
                 }
+                $offset += $toRead
             }
         }
-
-        # Advance to next region
-        $next = $address.ToInt64() + $regionSize
-        if ($next -lt 0) { break }  # overflow guard
-        $address = [IntPtr]::new($next)
     }
 
     [MemScan]::CloseHandle($hProc)
@@ -391,7 +415,6 @@ foreach ($proc in $procs) {
         Write-Host ("    [!!] {0} signature hit(s) found:" -f $hitCount) -ForegroundColor Red
         Write-Host ''
 
-        # Group by category for cleaner output
         $categories = @{
             'API / Module System'    = @('dev/zprestige/prestige/api/', 'dev/zprestige/prestige/client/management/')
             'Loader / Native Bridge' = @('dev/zprestige/prestige/loader/', 'dev.zprestige.prestige.Native', 'PrestigeClassLoader', 'PrestigeClient.java')
@@ -410,7 +433,7 @@ foreach ($proc in $procs) {
             foreach ($sig in $processHits.Keys) {
                 foreach ($pattern in $categories[$cat]) {
                     if ($sig -like "*$pattern*") {
-                        # For obfuscated classes, exclude the already-categorized ones
+                        # For obfuscated classes, exclude already-categorized ones
                         if ($cat -eq 'Obfuscated Classes') {
                             $isOther = $false
                             foreach ($otherCat in $categories.Keys) {
@@ -429,17 +452,17 @@ foreach ($proc in $procs) {
             }
             if ($catHits.Count -gt 0) {
                 Write-Host ("    ┌─ {0}" -f $cat) -ForegroundColor Yellow
-                $sigIdx = 0
                 $catKeys = @($catHits.Keys)
-                foreach ($sig in $catKeys) {
-                    $sigIdx++
+                for ($si = 0; $si -lt $catKeys.Count; $si++) {
+                    $sig = $catKeys[$si]
                     $addrs = $catHits[$sig]
-                    $prefix = if ($sigIdx -lt $catKeys.Count) { '├' } else { '└' }
+                    $prefix = if ($si -lt ($catKeys.Count - 1)) { '├' } else { '└' }
                     Write-Host ("    {0}─ " -f $prefix) -NoNewline -ForegroundColor DarkGray
                     Write-Host $sig -ForegroundColor White
-                    foreach ($a in $addrs) {
-                        $innerPrefix = if ($a -ne $addrs[-1]) { '│  ' } else { '   ' }
-                        $addrPrefix = if ($a -ne $addrs[-1]) { '├' } else { '└' }
+                    for ($ai = 0; $ai -lt $addrs.Count; $ai++) {
+                        $a = $addrs[$ai]
+                        $innerPrefix = if ($ai -lt ($addrs.Count - 1)) { '│  ' } else { '   ' }
+                        $addrPrefix = if ($ai -lt ($addrs.Count - 1)) { '├' } else { '└' }
                         Write-Host ("    {0}{1}─ {2} ({3} bytes)" -f $innerPrefix, $addrPrefix, $a, $sig.Length) -ForegroundColor DarkCyan
                     }
                 }
